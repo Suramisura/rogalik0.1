@@ -1,0 +1,2186 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Кидайте в меня камни, я построю из них замок</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #05070a;
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
+    font-family: ui-monospace, "Courier New", monospace;
+  }
+  canvas {
+    display: block;
+    border: 1px solid #1a2230;
+    box-shadow: 0 0 60px rgba(60, 120, 220, 0.15), 0 0 0 1px #0b0f16 inset;
+    cursor: crosshair;
+  }
+</style>
+</head>
+<body>
+<canvas id="c" width="960" height="640"></canvas>
+<script>
+(function () {
+'use strict';
+
+// ============================== КОНСТАНТЫ ==============================
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const W = 960, H = 640;
+const GY = 64; // HUD bar height (screen space)
+const CELL = 48;
+const WORLD_COLS = 40, WORLD_ROWS = 26;
+const WORLD_W = WORLD_COLS * CELL; // 1920
+const WORLD_H = WORLD_ROWS * CELL; // 1248
+const CORE = { c0: 19, c1: 20, r0: 12, r1: 13 };
+const CORE_WX = (CORE.c0 + 1) * CELL; // 960
+const CORE_WY = (CORE.r0 + 1) * CELL; // 624
+
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const rnd = (a, b) => a + Math.random() * (b - a);
+const cellX = c => c * CELL;
+const cellY = r => r * CELL;
+
+const MODULES = {
+  wall:  { name: 'СТЕНА',   cost: 4, color: '#8f9bb3', sym: '▮', desc: 'Блокирует врагов, имеет HP, дешёвый барьер.' },
+  tower: { name: 'БАШНЯ',   cost: 8, color: '#e0b44a', sym: '▲', desc: 'Стреляет по врагам. Лимит зависит от уровня ядра.' },
+  forge: { name: 'КУЗНИЦА', cost: 8, color: '#e0663a', sym: '✦', desc: 'Усиливает урон игрока и башен.' },
+  heal:  { name: 'ЛАЗАРЕТ', cost: 6, color: '#3ad0a0', sym: '✚', desc: 'Лечит игрока в радиусе действия.' }
+};
+const MOD_ORDER = ['wall', 'tower', 'forge', 'heal'];
+
+const ROCK_TYPES = {
+  normal: { dmg: 9,  stones: 1, r: 7,  speed: 300, color: '#cfd6e0', desc: 'Обычный камень. 1 ресурс.' },
+  heavy:  { dmg: 17, stones: 2, r: 11, speed: 240, color: '#a97b4e', desc: 'Тяжёлый. Больше урона и ресурсов.' },
+  glow:   { dmg: 6,  stones: 2, r: 8,  speed: 360, color: '#7cf6c8', desc: 'Светящийся. Восстанавливает HP при подборе.', heal: 3 }
+};
+
+const ENEMY_TYPES = {
+  grunt:  { hp: 24,  speed: 64,  range: 210, cd: 2.6, rock: 'normal', color: '#e05a4f', r: 13, desc: 'Базовый враг. Быстро идёт к ядру.' },
+  brute:  { hp: 72,  speed: 40,  range: 240, cd: 3.2, rock: 'heavy',  color: '#c07a2a', r: 19, desc: 'Медленный, толстый, ломает стены.' },
+  wisp:   { hp: 14,  speed: 112, range: 180, cd: 1.8, rock: 'glow',   color: '#6ee0c0', r: 10, desc: 'Быстрый и хрупкий. Стреляет светящимися.' },
+  sniper: { hp: 34,  speed: 52,  range: 340, cd: 3.4, rock: 'normal', color: '#9a6ee0', r: 14, desc: 'Дальний обстрел игрока.' },
+  boss:   { hp: 340, speed: 30,  range: 300, cd: 2.6, rock: 'heavy',  color: '#ff4a8a', r: 32, desc: 'Мини-босс. Веер камней и камнепад.' }
+};
+
+const RARITY_MULT = { common: 1, rare: 1.6, epic: 2.4 };
+const RARITY_COLOR = { common: '#8fa3bd', rare: '#6fa8ff', epic: '#c66fff' };
+const RARITY_NAME = { common: 'ОБЫЧНОЕ', rare: 'РЕДКОЕ', epic: 'ЭПИЧЕСКОЕ' };
+
+const UPGRADES = [
+  { id: 'granite', name: 'ГРАНИТНАЯ ПЛОТЬ', type: 'player', sym: '◆',
+    desc: m => '+' + Math.round(30 * m) + ' к макс. HP',
+    apply: m => { game.upg.maxHp += Math.round(30 * m); } },
+  { id: 'fast_legs', name: 'БЫСТРЫЕ НОГИ', type: 'player', sym: '◆',
+    desc: m => '+' + Math.round(12 * m) + '% скорости',
+    apply: m => { game.upg.speed += 0.12 * m; } },
+  { id: 'heavy_fist', name: 'ТЯЖЁЛЫЙ КУЛАК', type: 'player', sym: '◆',
+    desc: m => '+' + Math.round(25 * m) + '% урона',
+    apply: m => { game.upg.dmg += 0.25 * m; } },
+  { id: 'stone_skin', name: 'КАМЕННАЯ КОЖА', type: 'player', sym: '◆',
+    desc: m => '+' + Math.round(1 * m) + ' к броне',
+    apply: m => { game.upg.armor += Math.round(m); } },
+  { id: 'vamp', name: 'КРОВАВЫЙ КАМЕНЬ', type: 'player', sym: '◆',
+    desc: m => '+' + Math.round(2 * m) + ' HP за убийство',
+    apply: m => { game.upg.vamp += Math.round(2 * m); } },
+  { id: 'sharp_fangs', name: 'ЗАТОЧЕННЫЕ ЗУБЦЫ', type: 'castle', sym: '▲',
+    desc: m => '+' + Math.round(30 * m) + '% урона башен',
+    apply: m => { game.upg.towerDmg += 0.30 * m; } },
+  { id: 'gears', name: 'ШЕСТЕРНИ', type: 'castle', sym: '▲',
+    desc: m => '+' + Math.round(20 * m) + '% скорости башен',
+    apply: m => { game.upg.towerRate += 0.20 * m; } },
+  { id: 'holy_water', name: 'ЖИВАЯ ВОДА', type: 'castle', sym: '▲',
+    desc: m => '+' + (Math.round(0.5 * m * 10) / 10) + ' HP/сек вблизи лазарета',
+    apply: m => { game.upg.regen += 0.5 * m; } },
+  { id: 'tower_mastery', name: 'МАСТЕР БАШЕН', type: 'castle', sym: '▲',
+    desc: m => '+' + Math.round(20 * m) + '% урона всех модулей',
+    apply: m => { game.upg.towerDmg += 0.2 * m; } },
+  { id: 'scavenger', name: 'МУСОРЩИК', type: 'economy', sym: '●',
+    desc: m => '+' + Math.round(40 * m) + '% камней при подборе',
+    apply: m => { game.upg.stoneMul += 0.4 * m; } },
+  { id: 'magnet', name: 'МАГНИТ', type: 'economy', sym: '●',
+    desc: m => '+' + Math.round(60 * m) + ' к радиусу подбора',
+    apply: m => { game.upg.pickup += Math.round(60 * m); } },
+  { id: 'appetite', name: 'АППЕТИТ', type: 'economy', sym: '●',
+    desc: m => '+' + Math.round(3 * m) + ' камней за волну',
+    apply: m => { game.upg.waveBonus = (game.upg.waveBonus || 0) + Math.round(3 * m); } }
+];
+
+const SYNERGIES = [
+  { a: 'stone_skin', b: 'holy_water', name: 'КРЕПОСТЬ', desc: '+1 броня, +1.0 HP/сек',
+    apply: () => { game.upg.regen += 1.0; game.upg.armor += 1; } },
+  { a: 'sharp_fangs', b: 'gears', name: 'АРТИЛЛЕРИЯ', desc: 'Башни бьют двойным залпом',
+    apply: () => { game.upg.towerDouble = true; } },
+  { a: 'scavenger', b: 'magnet', name: 'СОБИРАТЕЛЬ', desc: '+40% камней, +40 радиус',
+    apply: () => { game.upg.stoneMul += 0.4; game.upg.pickup += 40; } }
+];
+
+const RELICS = [
+  { name: 'СЕРДЦЕ ГОРЫ',      sym: '♥', desc: '+50 HP, +2 броня',       apply: () => { game.upg.maxHp += 50; game.upg.armor += 2; } },
+  { name: 'ВЕЧНЫЙ КУЗНЕЦ',    sym: '✦', desc: '+30% урона башен',        apply: () => { game.upg.towerDmg += 0.3; } },
+  { name: 'КРОВАВЫЙ АЛТАРЬ',  sym: '♥', desc: '+3 HP за убийство',       apply: () => { game.upg.vamp += 3; } },
+  { name: 'СЧАСТЛИВЫЙ КАМЕНЬ',sym: '●', desc: '+25% камней',             apply: () => { game.upg.stoneMul += 0.25; } },
+  { name: 'КАМЕННЫЙ ДОЖДЬ',   sym: '◆', desc: '+2 камня за волну',       apply: () => { game.upg.waveBonus = (game.upg.waveBonus || 0) + 2; } }
+];
+
+const CURSES = [
+  { name: 'ЯРОСТЬ',         desc: 'Враги быстрее',       apply: () => { game.enemySpeedMul *= 1.2; } },
+  { name: 'ТЯЖЁЛЫЙ ВОЗДУХ', desc: 'Враги стреляют чаще', apply: () => { game.enemyRateMul *= 1.3; } },
+  { name: 'СКУПОСТЬ',       desc: 'Меньше камней',       apply: () => { game.upg.stoneMul = Math.max(0.3, game.upg.stoneMul - 0.25); } }
+];
+
+// Уровни ядра: индекс = уровень-1
+const CORE_LEVELS = [
+  { hp: 200, towerDmg: 0,    healRadius: 2, playerHp: 0,  maxTowers: 2,  ring: 1, cost: 0,  reqModules: 0 },
+  { hpAdd: 100, towerDmg: 0.10, healRadius: 3, playerHp: 10, maxTowers: 4,  ring: 2, cost: 8,  reqModules: 3 },
+  { hpAdd: 150, towerDmg: 0.15, healRadius: 4, playerHp: 10, maxTowers: 6,  ring: 3, cost: 16, reqModules: 6 },
+  { hpAdd: 200, towerDmg: 0.25, healRadius: 5, playerHp: 15, maxTowers: 8,  ring: 4, cost: 28, reqModules: 10 },
+  { hpAdd: 250, towerDmg: 0.40, healRadius: 6, playerHp: 20, maxTowers: 10, ring: 5, cost: 44, reqModules: 15 }
+];
+
+// ============================== СОСТОЯНИЕ ==============================
+let game = null;
+let cam = { x: 0, y: 0 };
+const keys = Object.create(null);
+const mouse = { x: 0, y: 0, wx: 0, wy: 0, down: false };
+let bgGrad = null;
+
+function initBg() {
+  bgGrad = ctx.createRadialGradient(W / 2, H / 2, 100, W / 2, H / 2, 720);
+  bgGrad.addColorStop(0, '#0e1420');
+  bgGrad.addColorStop(0.55, '#080c14');
+  bgGrad.addColorStop(1, '#03050a');
+}
+
+function coreStats(level) {
+  const s = { hp: 200, towerDmg: 0, healRadius: 2, playerHp: 0, maxTowers: 2, ring: 1 };
+  for (let i = 1; i < level; i++) {
+    const L = CORE_LEVELS[i];
+    s.hp += L.hpAdd;
+    s.towerDmg += L.towerDmg;
+    s.healRadius = L.healRadius;
+    s.playerHp += L.playerHp;
+    s.maxTowers = L.maxTowers;
+    s.ring = L.ring;
+  }
+  return s;
+}
+
+function computeStats() {
+  const cs = coreStats(game.coreLevel);
+  const s = {
+    armor: 0,
+    maxHpBonus: cs.playerHp,
+    dmgMul: 1,
+    towerDmgMul: 1 + cs.towerDmg,
+    towerRateMul: 1,
+    healPerSec: 0,
+    healRadius: cs.healRadius * CELL,
+    maxTowers: cs.maxTowers
+  };
+  for (const k in game.modules) {
+    const m = game.modules[k], lv = m.level;
+    if (m.type === 'wall')      { s.armor += Math.floor(lv / 2); s.maxHpBonus += 4 * lv; }
+    else if (m.type === 'tower'){ s.towerDmgMul += 0.10 * lv; s.towerRateMul += 0.08 * lv; }
+    else if (m.type === 'forge'){ s.dmgMul += 0.15 * lv; s.towerDmgMul += 0.08 * lv; }
+  }
+  s.armor        += game.upg.armor;
+  s.maxHpBonus   += game.upg.maxHp;
+  s.dmgMul       += game.upg.dmg;
+  s.towerDmgMul  += game.upg.towerDmg;
+  s.towerRateMul += game.upg.towerRate;
+  s.healPerSec    = game.upg.regen;
+  s.moveMul       = 1 + game.upg.speed;
+  s.stoneMul      = Math.max(0.2, 1 + game.upg.stoneMul);
+  s.towerDouble   = !!game.upg.towerDouble;
+  game.stats = s;
+
+  const newMax = 100 + s.maxHpBonus;
+  if (newMax !== game.maxHp) {
+    const diff = newMax - game.maxHp;
+    game.maxHp = newMax;
+    if (diff > 0) game.hp = Math.min(game.maxHp, game.hp + diff);
+    else game.hp = Math.min(game.hp, game.maxHp);
+  }
+}
+
+function recomputeCoreHp() {
+  const cs = coreStats(game.coreLevel);
+  const diff = cs.hp - game.coreMaxHp;
+  game.coreMaxHp = cs.hp;
+  if (diff > 0) game.coreHp = Math.min(cs.hp, game.coreHp + diff);
+  else game.coreHp = Math.min(game.coreHp, cs.hp);
+}
+
+function resetGame() {
+  game = {
+    state: 'start',
+    wave: 0,
+    stones: 0,
+    hp: 100,
+    maxHp: 100,
+    coreLevel: 1,
+    coreHp: 200,
+    coreMaxHp: 200,
+    coreFlash: 0,
+    prepMode: 'timer',
+    prepTimer: 0,
+    waveActive: false,
+    player: {
+      x: CORE_WX, y: CORE_WY + 120,
+      vx: 0, vy: 0, ang: -Math.PI / 2, atkCd: 0, swing: 0,
+      kbx: 0, kby: 0, trail: []
+    },
+    enemies: [], shots: [], tshots: [], rocks: [], parts: [], floats: [],
+    modules: {},
+    buildMode: false, buildSel: 0,
+    stats: {},
+    upg: {
+      maxHp: 0, speed: 0, dmg: 0, armor: 0, towerDmg: 0, towerRate: 0,
+      regen: 0, stoneMul: 0, vamp: 0, pickup: 0, waveBonus: 0, towerDouble: false
+    },
+    ownedUpgrades: new Set(),
+    triggeredSynergies: new Set(),
+    relics: [], curses: [],
+    enemySpeedMul: 1, enemyRateMul: 1,
+    waveModifier: 'normal',
+    spawnQueue: [], spawnTimer: 0, startTimer: 0,
+    rainTimer: 0,
+    choices: [],
+    score: 0,
+    kills: 0,
+    best: +(localStorage.getItem('castle_best') || 0),
+    bestWave: +(localStorage.getItem('castle_best_wave') || 0),
+    msg: '', msgT: 0, t: 0,
+    shake: 0, hitstop: 0,
+    dmgFlash: 0, goldFlash: 0,
+    hpPulse: 0, stonePulse: 0,
+    deadReason: '',
+    encOpen: false, encTab: 0
+  };
+  cam.x = clamp(game.player.x - W / 2, 0, WORLD_W - W);
+  cam.y = clamp(game.player.y - H / 2, 0, WORLD_H - H);
+  recomputeCoreHp();
+  game.coreHp = game.coreMaxHp;
+  computeStats();
+  game.hp = game.maxHp;
+}
+
+function startRun() {
+  const prepMode = game ? game.prepMode : 'timer';
+  resetGame();
+  game.prepMode = prepMode;
+  game.state = 'playing';
+  game.wave = 1;
+  game.waveActive = true;
+  game.spawnQueue = buildWave(game.wave);
+  game.spawnTimer = 0.4;
+  game.waveModifier = 'normal';
+  flash('ВОЛНА ' + game.wave);
+}
+
+function flash(text) { game.msg = text; game.msgT = 2.0; }
+
+function floatText(x, y, txt, color, size) {
+  game.floats.push({ x, y, txt, color, size: size || 12, life: 0.9, max: 0.9, vy: -70 });
+}
+
+// ============================== ВОЛНЫ ==============================
+function buildWave(w) {
+  const list = [];
+  const isBoss = (w % 5 === 0);
+  const base = isBoss ? Math.max(2, Math.floor(w * 0.5)) : 2 + Math.floor(w * 0.9);
+  for (let i = 0; i < base; i++) list.push('grunt');
+  if (w >= 3) for (let i = 0; i < Math.floor((w - 1) / 2); i++) list.push('brute');
+  if (w >= 5 && !isBoss) for (let i = 0; i < Math.floor((w - 3) / 2); i++) list.push('wisp');
+  if (w >= 7 && !isBoss) for (let i = 0; i < Math.floor((w - 5) / 2); i++) list.push('sniper');
+  if (isBoss) list.push('boss');
+  for (let i = list.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const t = list[i]; list[i] = list[j]; list[j] = t;
+  }
+  return list;
+}
+
+function rollWaveModifier(w) {
+  if (w < 2) return 'normal';
+  const mods = ['normal', 'normal', 'rain', 'fast', 'greedy', 'quiet'];
+  return mods[Math.floor(Math.random() * mods.length)];
+}
+
+function startWave() {
+  game.wave++;
+  game.waveActive = true;
+  game.spawnQueue = buildWave(game.wave);
+  game.spawnTimer = 0.4;
+  game.waveModifier = rollWaveModifier(game.wave);
+  game.rainTimer = 0.8;
+  if (game.waveModifier !== 'normal') {
+    const names = { rain: 'КАМЕННЫЙ ДОЖДЬ', fast: 'БЫСТРАЯ ВОЛНА', greedy: 'ЖАДНАЯ ВОЛНА', quiet: 'ТИХАЯ ВОЛНА' };
+    flash(names[game.waveModifier]);
+  } else {
+    flash('ВОЛНА ' + game.wave);
+  }
+  if (game.wave % 5 === 0) setTimeout(() => { if (game.state === 'playing') flash('МИНИ-БОСС!'); }, 400);
+}
+
+function clearWave() {
+  game.waveActive = false;
+  game.waveModifier = 'normal';
+  if (game.upg.waveBonus > 0) { game.stones += game.upg.waveBonus; game.stonePulse = 1; }
+  if (game.wave % 5 === 0 && game.relics.length < RELICS.length) {
+    const relic = RELICS[game.relics.length];
+    relic.apply();
+    game.relics.push(relic.name);
+    computeStats();
+    setTimeout(() => { if (game.state === 'upgrade') flash('РЕЛИКВИЯ: ' + relic.name); }, 100);
+  }
+  game.state = 'upgrade';
+  game.choices = pickChoices();
+  game.score += 20 * game.wave;
+}
+
+function pickChoices() {
+  const byType = { player: [], castle: [], economy: [] };
+  for (const u of UPGRADES) byType[u.type].push(u);
+  const picks = [];
+  for (const type of ['player', 'castle', 'economy']) {
+    const pool = byType[type];
+    const u = pool[Math.floor(Math.random() * pool.length)];
+    const r = Math.random();
+    let rarity = r < 0.55 ? 'common' : (r < 0.88 ? 'rare' : 'epic');
+    picks.push({ upgrade: u, rarity });
+  }
+  for (let i = picks.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const t = picks[i]; picks[i] = picks[j]; picks[j] = t;
+  }
+  return picks;
+}
+
+function applyChoice(choice) {
+  const u = choice.upgrade;
+  const mult = RARITY_MULT[choice.rarity];
+  u.apply(mult);
+  game.ownedUpgrades.add(u.id);
+  for (const syn of SYNERGIES) {
+    if (game.ownedUpgrades.has(syn.a) && game.ownedUpgrades.has(syn.b) && !game.triggeredSynergies.has(syn.name)) {
+      syn.apply();
+      game.triggeredSynergies.add(syn.name);
+      setTimeout(() => flash('СИНЕРГИЯ: ' + syn.name), 200);
+    }
+  }
+  if (choice.rarity === 'epic') {
+    const curse = CURSES[Math.floor(Math.random() * CURSES.length)];
+    curse.apply();
+    game.curses.push(curse.name);
+    setTimeout(() => flash('ПРОКЛЯТИЕ: ' + curse.name), 300);
+  }
+  computeStats();
+  game.choices = [];
+  game.state = 'playing';
+  game.prepTimer = game.prepMode === 'timer' ? (game.wave < 3 ? 20 : 15) : Infinity;
+}
+
+// ============================== СПАВН ==============================
+function spawnEnemy(type) {
+  const def = ENEMY_TYPES[type];
+  const isBoss = type === 'boss';
+  const isElite = !isBoss && Math.random() < (game.waveModifier === 'quiet' ? 0.35 : 0.08);
+  let x, y;
+  const side = Math.floor(Math.random() * 4);
+  if (side === 0)      { x = rnd(40, WORLD_W - 40); y = -30; }
+  else if (side === 1) { x = WORLD_W + 30;          y = rnd(40, WORLD_H - 40); }
+  else if (side === 2) { x = rnd(40, WORLD_W - 40); y = WORLD_H + 30; }
+  else                 { x = -30;                   y = rnd(40, WORLD_H - 40); }
+
+  const hpMul = 1 + 0.18 * (game.wave - 1);
+  const dmgMul = 1 + 0.08 * (game.wave - 1);
+  const eliteHp = isElite ? 2.5 : 1;
+  const eliteDmg = isElite ? 1.3 : 1;
+  const eliteR = isElite ? 1.3 : 1;
+
+  game.enemies.push({
+    type, x, y,
+    r: def.r * eliteR,
+    color: def.color,
+    hp: def.hp * hpMul * eliteHp,
+    maxHp: def.hp * hpMul * eliteHp,
+    speed: def.speed,
+    range: def.range,
+    cd: rnd(0.4, 1.4),
+    shootCd: rnd(0.8, 2.0),
+    meleeCd: 0,
+    rockType: def.rock,
+    dmgMul: dmgMul * eliteDmg,
+    flash: 0, dead: false, wob: Math.random() * 6.28,
+    kbx: 0, kby: 0,
+    isElite, isBoss,
+    atkMode: 'fan'
+  });
+}
+
+// ============================== БОЙ ==============================
+function spawnParticles(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = rnd(40, 220);
+    game.parts.push({
+      x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+      life: rnd(0.25, 0.7), max: 0.7, color, size: rnd(2, 4.8)
+    });
+  }
+}
+
+function hurtEnemy(e, dmg, isHeavy) {
+  if (e.dead) return;
+  e.hp -= dmg;
+  e.flash = 0.14;
+  spawnParticles(e.x, e.y, '#ffd9a0', isHeavy ? 8 : 4);
+  floatText(e.x, e.y - e.r - 8, '-' + Math.round(dmg), '#ffe0a0', isHeavy ? 14 : 11);
+  if (isHeavy) { game.hitstop = Math.max(game.hitstop, 0.05); game.shake = Math.max(game.shake, 0.12); }
+  const dx = e.x - game.player.x, dy = e.y - game.player.y;
+  const d = Math.hypot(dx, dy) || 1;
+  e.kbx += (dx / d) * (isHeavy ? 200 : 120);
+  e.kby += (dy / d) * (isHeavy ? 200 : 120);
+  if (e.hp <= 0) {
+    e.dead = true;
+    game.kills++;
+    game.score += 12 + game.wave * 2 + (e.isElite ? 20 : 0) + (e.isBoss ? 100 : 0);
+    game.shake = Math.max(game.shake, e.isBoss ? 0.5 : 0.15);
+    game.hitstop = Math.max(game.hitstop, e.isBoss ? 0.1 : 0.03);
+    spawnParticles(e.x, e.y, e.color, e.isBoss ? 40 : 16);
+    let drops = 1;
+    if (e.isBoss) drops = 8;
+    else if (e.isElite) drops = 3 + Math.floor(Math.random() * 3);
+    else if (e.type === 'brute') drops = 2;
+    for (let i = 0; i < drops; i++) {
+      const rt = Math.random() < 0.25 ? 'heavy' : (Math.random() < 0.15 ? 'glow' : 'normal');
+      dropRock(e.x + rnd(-18, 18), e.y + rnd(-18, 18), rt);
+    }
+    if (e.isElite && Math.random() < 0.18 && game.relics.length < RELICS.length) {
+      const relic = RELICS[game.relics.length];
+      relic.apply();
+      game.relics.push(relic.name);
+      computeStats();
+      flash('РЕЛИКВИЯ: ' + relic.name);
+    }
+    if (game.upg.vamp > 0) { game.hp = Math.min(game.maxHp, game.hp + game.upg.vamp); game.hpPulse = 1; }
+  }
+}
+
+function damageWall(wall, dmg) {
+  wall.hp -= dmg;
+  wall.flash = 0.14;
+  if (wall.hp <= 0) destroyWall(wall);
+}
+
+function destroyWall(wall) {
+  const key = wall.c + ',' + wall.r;
+  delete game.modules[key];
+  spawnParticles(cellX(wall.c) + CELL / 2, cellY(wall.r) + CELL / 2, '#8f9bb3', 22);
+  game.shake = Math.max(game.shake, 0.15);
+  const drops = 1 + Math.floor(wall.level / 2);
+  for (let i = 0; i < drops; i++) {
+    dropRock(cellX(wall.c) + CELL / 2 + rnd(-15, 15), cellY(wall.r) + CELL / 2 + rnd(-15, 15), 'normal');
+  }
+  computeStats();
+}
+
+function damagePlayer(amount, sx, sy) {
+  const dmg = Math.max(1, amount - game.stats.armor);
+  game.hp -= dmg;
+  game.shake = Math.min(0.5, game.shake + 0.22);
+  game.hitstop = Math.max(game.hitstop, 0.045);
+  game.dmgFlash = Math.min(1, game.dmgFlash + 0.7);
+  game.hpPulse = 1;
+  floatText(game.player.x, game.player.y - 26, '-' + Math.round(dmg), '#ff6a5a', 16);
+  spawnParticles(game.player.x, game.player.y, '#ff6a5a', 10);
+  if (sx !== undefined && sy !== undefined) {
+    const dx = game.player.x - sx, dy = game.player.y - sy;
+    const d = Math.hypot(dx, dy) || 1;
+    game.player.kbx += (dx / d) * 280;
+    game.player.kby += (dy / d) * 280;
+  }
+  if (game.hp <= 0) { game.hp = 0; die('игрок'); }
+}
+
+function damageCore(amount) {
+  game.coreHp -= amount;
+  game.coreFlash = 0.3;
+  game.dmgFlash = Math.min(1, game.dmgFlash + 0.4);
+  game.shake = Math.max(game.shake, 0.25);
+  spawnParticles(CORE_WX, CORE_WY, '#7fb0ff', 8);
+  floatText(CORE_WX + rnd(-20, 20), CORE_WY - 40, '-' + Math.round(amount), '#7fb0ff', 14);
+  if (game.coreHp <= 0) { game.coreHp = 0; die('ядро'); }
+}
+
+function die(reason) {
+  if (game.state === 'dead') return;
+  game.state = 'dead';
+  game.deadReason = reason;
+  game.score += game.wave * 40;
+  if (game.score > game.best) {
+    game.best = game.score;
+    localStorage.setItem('castle_best', String(game.best));
+  }
+  if (game.wave > game.bestWave) {
+    game.bestWave = game.wave;
+    localStorage.setItem('castle_best_wave', String(game.bestWave));
+  }
+  spawnParticles(game.player.x, game.player.y, '#ffffff', 40);
+  game.shake = 0.7;
+  game.hitstop = 0.12;
+}
+
+function dropRock(x, y, type) {
+  game.rocks.push({
+    x: clamp(x, 12, WORLD_W - 12),
+    y: clamp(y, 12, WORLD_H - 12),
+    type, t: Math.random() * 6, spawnT: 0.35
+  });
+  if (game.rocks.length > 120) game.rocks.shift();
+}
+
+function collectRock(r, idx) {
+  const rt = ROCK_TYPES[r.type];
+  let gain = Math.max(1, Math.round(rt.stones * game.stats.stoneMul));
+  if (game.waveModifier === 'greedy') gain *= 2;
+  game.stones += gain;
+  game.stonePulse = 1;
+  floatText(r.x, r.y - 10, '+' + gain, rt.color, 14);
+  if (rt.heal) {
+    game.hp = Math.min(game.maxHp, game.hp + rt.heal);
+    game.goldFlash = 1;
+    game.hpPulse = 1;
+    floatText(game.player.x, game.player.y - 32, '+' + rt.heal + ' HP', '#6ee0c0', 12);
+  }
+  spawnParticles(r.x, r.y, rt.color, 9);
+  game.rocks.splice(idx, 1);
+}
+
+function tryAttack() {
+  const p = game.player;
+  if (p.atkCd > 0) return;
+  p.atkCd = 0.40;
+  p.swing = 0.18;
+  const range = 62, halfArc = Math.PI * 0.55;
+  const dmg = 11 * game.stats.dmgMul;
+  for (let i = 0; i < game.enemies.length; i++) {
+    const e = game.enemies[i];
+    if (e.dead) continue;
+    const dx = e.x - p.x, dy = e.y - p.y;
+    const d = Math.hypot(dx, dy);
+    if (d > range + e.r) continue;
+    let a = Math.atan2(dy, dx) - p.ang;
+    a = Math.atan2(Math.sin(a), Math.cos(a));
+    if (Math.abs(a) > halfArc) continue;
+    hurtEnemy(e, dmg, true);
+  }
+  spawnParticles(p.x + Math.cos(p.ang) * 40, p.y + Math.sin(p.ang) * 40, '#9fd0ff', 4);
+}
+
+// ============================== СТРОИТЕЛЬСТВО ==============================
+function cellDistance(c, r) {
+  const dx = c < CORE.c0 ? CORE.c0 - c : (c > CORE.c1 ? c - CORE.c1 : 0);
+  const dy = r < CORE.r0 ? CORE.r0 - r : (r > CORE.r1 ? r - CORE.r1 : 0);
+  return Math.max(dx, dy);
+}
+
+function maxRing() { return coreStats(game.coreLevel).ring; }
+
+function isBuildable(c, r) {
+  if (c < 0 || c >= WORLD_COLS || r < 0 || r >= WORLD_ROWS) return false;
+  const d = cellDistance(c, r);
+  return d >= 1 && d <= maxRing();
+}
+
+function countModules() { return Object.keys(game.modules).length; }
+function countTowers() {
+  let n = 0;
+  for (const k in game.modules) if (game.modules[k].type === 'tower') n++;
+  return n;
+}
+
+function tryPlace(wx, wy) {
+  const c = Math.floor(wx / CELL);
+  const r = Math.floor(wy / CELL);
+  if (!isBuildable(c, r)) return;
+  const key = c + ',' + r;
+  const existing = game.modules[key];
+
+  if (existing) {
+    if (existing.level >= 5) { flash('МАКС. УРОВЕНЬ'); return; }
+    const cost = MODULES[existing.type].cost + existing.level * 3;
+    if (game.stones < cost) { flash('НУЖНО ' + cost + ' КАМНЕЙ'); return; }
+    game.stones -= cost;
+    existing.level++;
+    existing.flash = 0.5;
+    if (existing.type === 'wall') {
+      existing.maxHp = 40 + 25 * existing.level;
+      existing.hp = existing.maxHp;
+    }
+    game.goldFlash = Math.max(game.goldFlash, 0.5);
+    spawnParticles(cellX(c) + CELL / 2, cellY(r) + CELL / 2, MODULES[existing.type].color, 16);
+  } else {
+    const type = MOD_ORDER[game.buildSel];
+    const cost = MODULES[type].cost;
+    if (type === 'tower' && countTowers() >= game.stats.maxTowers) {
+      flash('ЛИМИТ БАШЕН: ' + game.stats.maxTowers);
+      return;
+    }
+    if (game.stones < cost) { flash('НУЖНО ' + cost + ' КАМНЕЙ'); return; }
+    game.stones -= cost;
+    const mod = { type, level: 1, c, r, cd: 0, flash: 0.5 };
+    if (type === 'wall') { mod.maxHp = 65; mod.hp = 65; }
+    game.modules[key] = mod;
+    game.goldFlash = Math.max(game.goldFlash, 0.5);
+    spawnParticles(cellX(c) + CELL / 2, cellY(r) + CELL / 2, MODULES[type].color, 18);
+  }
+  game.stonePulse = 1;
+  computeStats();
+}
+
+function upgradeCore() {
+  if (game.coreLevel >= 5) { flash('ЯДРО УЖЕ МАКС'); return; }
+  const next = game.coreLevel + 1;
+  const L = CORE_LEVELS[next - 1];
+  if (countModules() < L.reqModules) { flash('НУЖНО МОДУЛЕЙ: ' + L.reqModules); return; }
+  if (game.stones < L.cost) { flash('НУЖНО ' + L.cost + ' КАМНЕЙ'); return; }
+  game.stones -= L.cost;
+  game.coreLevel = next;
+  recomputeCoreHp();
+  computeStats();
+  game.goldFlash = 1;
+  game.stonePulse = 1;
+  spawnParticles(CORE_WX, CORE_WY, '#7fb0ff', 40);
+  flash('ЯДРО УР.' + next);
+}
+
+// ============================== ОБНОВЛЕНИЕ ==============================
+function updateCamera(dt) {
+  const tx = clamp(game.player.x - W / 2, 0, WORLD_W - W);
+  const ty = clamp(game.player.y - H / 2, 0, WORLD_H - H);
+  cam.x += (tx - cam.x) * Math.min(1, 8 * dt);
+  cam.y += (ty - cam.y) * Math.min(1, 8 * dt);
+}
+
+function updatePlaying(dt) {
+  const p = game.player;
+
+  // Движение
+  let mx = 0, my = 0;
+  if (keys['KeyW'] || keys['ArrowUp'])    my--;
+  if (keys['KeyS'] || keys['ArrowDown'])  my++;
+  if (keys['KeyA'] || keys['ArrowLeft'])  mx--;
+  if (keys['KeyD'] || keys['ArrowRight']) mx++;
+  const len = Math.hypot(mx, my);
+  const sp = 200 * game.stats.moveMul;
+  if (len > 0) {
+    mx /= len; my /= len;
+    p.vx = mx * sp; p.vy = my * sp;
+    p.trail.push({ x: p.x, y: p.y, life: 0.35 });
+    if (p.trail.length > 12) p.trail.shift();
+  } else { p.vx = 0; p.vy = 0; }
+  p.x = clamp(p.x + (p.vx + p.kbx) * dt, 18, WORLD_W - 18);
+  p.y = clamp(p.y + (p.vy + p.kby) * dt, 18, WORLD_H - 18);
+  p.kbx *= Math.max(0, 1 - 8 * dt);
+  p.kby *= Math.max(0, 1 - 8 * dt);
+  for (const tr of p.trail) tr.life -= dt;
+  p.trail = p.trail.filter(tr => tr.life > 0);
+
+  // Прицел и атака (в мировых координатах)
+  const mwx = mouse.x + cam.x, mwy = mouse.y + cam.y;
+  p.ang = Math.atan2(mwy - p.y, mwx - p.x);
+  p.atkCd -= dt;
+  p.swing = Math.max(0, p.swing - dt);
+  if (mouse.down && !game.buildMode) tryAttack();
+
+  // Лечение: только вблизи лазаретов
+  if (game.hp < game.maxHp) {
+    let healRate = 0;
+    for (const k in game.modules) {
+      const m = game.modules[k];
+      if (m.type === 'heal') {
+        const mxh = cellX(m.c) + CELL / 2, myh = cellY(m.r) + CELL / 2;
+        const d = Math.hypot(p.x - mxh, p.y - myh);
+        if (d < 110 + m.level * 15) healRate += 0.5 * m.level + game.upg.regen;
+      }
+    }
+    if (healRate > 0) game.hp = Math.min(game.maxHp, game.hp + healRate * dt);
+  }
+
+  // Сбор камней
+  const autoR = 26 + game.upg.pickup;
+  const eR = 110 + game.upg.pickup;
+  for (let i = game.rocks.length - 1; i >= 0; i--) {
+    const r = game.rocks[i];
+    r.spawnT = Math.max(0, r.spawnT - dt);
+    const d = Math.hypot(r.x - p.x, r.y - p.y);
+    if (d < autoR || (keys['KeyE'] && d < eR)) collectRock(r, i);
+  }
+
+  // Модули: башни
+  for (const k in game.modules) {
+    const m = game.modules[k];
+    m.flash = Math.max(0, (m.flash || 0) - dt);
+    if (m.type === 'tower') {
+      m.cd -= dt;
+      if (m.cd <= 0) {
+        const cx = cellX(m.c) + CELL / 2, cy = cellY(m.r) + CELL / 2;
+        const rng = 200 + 25 * m.level;
+        let best = null, bd = 1e9;
+        for (let i = 0; i < game.enemies.length; i++) {
+          const e = game.enemies[i];
+          if (e.dead) continue;
+          const d = Math.hypot(e.x - cx, e.y - cy);
+          if (d < rng && d < bd) { bd = d; best = e; }
+        }
+        if (best) {
+          m.cd = 1.5 / game.stats.towerRateMul;
+          const dmg = (4 + 2 * m.level) * game.stats.towerDmgMul;
+          game.tshots.push({ x: cx, y: cy, target: best, speed: 430, dmg });
+          if (game.stats.towerDouble) {
+            game.tshots.push({ x: cx + 6, y: cy + 6, target: best, speed: 430, dmg: dmg * 0.6 });
+          }
+        } else m.cd = 0.15;
+      }
+    }
+  }
+
+  // Каменный дождь
+  if (game.waveModifier === 'rain' && game.waveActive) {
+    game.rainTimer -= dt;
+    if (game.rainTimer <= 0) {
+      game.rainTimer = 1.6;
+      const tx = rnd(60, WORLD_W - 60);
+      const ty = rnd(60, WORLD_H - 60);
+      game.shots.push({
+        x: tx + rnd(-60, 60), y: -30,
+        tx, ty, type: Math.random() < 0.3 ? 'heavy' : 'normal',
+        dmg: 10, speed: 400
+      });
+    }
+  }
+
+  // Враги
+  for (let i = 0; i < game.enemies.length; i++) {
+    const e = game.enemies[i];
+    if (e.dead) continue;
+    e.flash = Math.max(0, e.flash - dt);
+    e.meleeCd -= dt;
+    e.shootCd -= dt;
+    e.wob += dt * 6;
+
+    const dxC = CORE_WX - e.x, dyC = CORE_WY - e.y;
+    const dC = Math.hypot(dxC, dyC) || 1;
+
+    // У ядра — атака ядра
+    if (dC < CELL * 1.3) {
+      if (e.meleeCd <= 0) {
+        damageCore((e.isBoss ? 40 : 14) * e.dmgMul);
+        e.meleeCd = 1.5;
+        spawnParticles(e.x, e.y, '#ff8a5a', 8);
+      }
+    } else {
+      // Движение к ядру
+      const step = e.speed * game.enemySpeedMul * (game.waveModifier === 'fast' ? 1.3 : 1) * dt;
+      const nx = e.x + (dxC / dC) * step;
+      const ny = e.y + (dyC / dC) * step;
+      const wc = Math.floor(nx / CELL);
+      const wr = Math.floor(ny / CELL);
+      const wall = game.modules[wc + ',' + wr];
+      if (wall && wall.type === 'wall') {
+        if (e.meleeCd <= 0) {
+          damageWall(wall, (e.isBoss ? 50 : 10) * e.dmgMul);
+          e.meleeCd = 1.2;
+        }
+      } else {
+        e.x = nx + e.kbx * dt;
+        e.y = ny + e.kby * dt;
+      }
+    }
+    e.kbx *= Math.max(0, 1 - 6 * dt);
+    e.kby *= Math.max(0, 1 - 6 * dt);
+
+    // Стрельба по игроку
+    const pdx = p.x - e.x, pdy = p.y - e.y;
+    const pd = Math.hypot(pdx, pdy);
+    if (e.isBoss && e.shootCd <= 0 && pd < e.range) {
+      if (e.atkMode === 'fan') {
+        for (let a = -2; a <= 2; a++) {
+          const ang = Math.atan2(p.y - e.y, p.x - e.x) + a * 0.28;
+          game.shots.push({
+            x: e.x, y: e.y,
+            tx: e.x + Math.cos(ang) * 600,
+            ty: e.y + Math.sin(ang) * 600,
+            type: 'heavy', dmg: 12 * e.dmgMul, speed: 250
+          });
+        }
+        e.atkMode = 'rain';
+      } else {
+        for (let k = 0; k < 5; k++) {
+          const tx = clamp(p.x + rnd(-160, 160), 40, WORLD_W - 40);
+          const ty = clamp(p.y + rnd(-160, 160), 40, WORLD_H - 40);
+          game.shots.push({ x: tx, y: -30, tx, ty, type: 'heavy', dmg: 10 * e.dmgMul, speed: 380 });
+        }
+        e.atkMode = 'fan';
+      }
+      e.shootCd = 3.0 / game.enemyRateMul;
+      spawnParticles(e.x, e.y, '#ff8ab0', 12);
+    } else if (!e.isBoss && e.shootCd <= 0 && pd < e.range) {
+      const rt = ROCK_TYPES[e.rockType];
+      game.shots.push({
+        x: e.x, y: e.y,
+        tx: p.x + p.vx * 0.16, ty: p.y + p.vy * 0.16,
+        type: e.rockType, dmg: rt.dmg * e.dmgMul, speed: rt.speed
+      });
+      e.shootCd = ENEMY_TYPES[e.type].cd * rnd(0.85, 1.2) / game.enemyRateMul;
+    }
+  }
+
+  // Камни врагов
+  for (let i = game.shots.length - 1; i >= 0; i--) {
+    const s = game.shots[i];
+    const rt = ROCK_TYPES[s.type];
+    const dx = s.tx - s.x, dy = s.ty - s.y;
+    const d = Math.hypot(dx, dy) || 1;
+    const step = s.speed * dt;
+
+    // Попадание в игрока
+    const pdx = p.x - s.x, pdy = p.y - s.y;
+    if (Math.hypot(pdx, pdy) < 16 + rt.r * 0.75) {
+      damagePlayer(s.dmg, s.x, s.y);
+      dropRock(s.x + rnd(-14, 14), s.y + rnd(-14, 14), s.type);
+      spawnParticles(s.x, s.y, rt.color, 12);
+      game.shots.splice(i, 1);
+      continue;
+    }
+
+    // Попадание в стену по пути
+    const wc = Math.floor(s.x / CELL);
+    const wr = Math.floor(s.y / CELL);
+    const wall = game.modules[wc + ',' + wr];
+    if (wall && wall.type === 'wall') {
+      damageWall(wall, s.dmg * 0.7);
+      dropRock(s.x, s.y, s.type);
+      spawnParticles(s.x, s.y, rt.color, 6);
+      game.shots.splice(i, 1);
+      continue;
+    }
+
+    // Попадание в ядро (если летел внутрь)
+    if (Math.abs(s.x - CORE_WX) < CELL && Math.abs(s.y - CORE_WY) < CELL) {
+      damageCore(s.dmg * 0.5);
+      dropRock(s.x, s.y, s.type);
+      game.shots.splice(i, 1);
+      continue;
+    }
+
+    if (d <= step) {
+      dropRock(s.tx, s.ty, s.type);
+      spawnParticles(s.tx, s.ty, rt.color, 5);
+      game.shots.splice(i, 1);
+      continue;
+    }
+    s.x += dx / d * step;
+    s.y += dy / d * step;
+  }
+
+  // Снаряды башен
+  for (let i = game.tshots.length - 1; i >= 0; i--) {
+    const s = game.tshots[i];
+    const e = s.target;
+    if (!e || e.dead) { game.tshots.splice(i, 1); continue; }
+    const dx = e.x - s.x, dy = e.y - s.y;
+    const d = Math.hypot(dx, dy) || 1;
+    const step = s.speed * dt;
+    if (d <= step + e.r) {
+      hurtEnemy(e, s.dmg, false);
+      spawnParticles(e.x, e.y, '#ffe08a', 6);
+      game.tshots.splice(i, 1);
+      continue;
+    }
+    s.x += dx / d * step;
+    s.y += dy / d * step;
+  }
+
+  if (game.enemies.some(e => e.dead)) game.enemies = game.enemies.filter(e => !e.dead);
+
+  // Волновой цикл
+  if (game.waveActive) {
+    if (game.spawnQueue.length > 0) {
+      game.spawnTimer -= dt;
+      if (game.spawnTimer <= 0) {
+        spawnEnemy(game.spawnQueue.shift());
+        game.spawnTimer = 0.75;
+      }
+    } else if (game.enemies.length === 0) {
+      clearWave();
+    }
+  } else {
+    // Фаза подготовки
+    if (game.prepMode === 'timer') {
+      game.prepTimer -= dt;
+      if (game.prepTimer <= 0) startWave();
+    }
+  }
+}
+
+function updateFloats(dt) {
+  for (let i = game.floats.length - 1; i >= 0; i--) {
+    const f = game.floats[i];
+    f.life -= dt;
+    f.y += f.vy * dt;
+    f.vy *= Math.max(0, 1 - 2 * dt);
+    if (f.life <= 0) game.floats.splice(i, 1);
+  }
+}
+
+function updateParticles(dt) {
+  for (let i = game.parts.length - 1; i >= 0; i--) {
+    const pt = game.parts[i];
+    pt.life -= dt;
+    if (pt.life <= 0) { game.parts.splice(i, 1); continue; }
+    pt.x += pt.vx * dt;
+    pt.y += pt.vy * dt;
+    pt.vx *= Math.max(0, 1 - 4 * dt);
+    pt.vy *= Math.max(0, 1 - 4 * dt);
+  }
+}
+
+function update(dt) {
+  game.t += dt;
+  game.msgT = Math.max(0, game.msgT - dt);
+  game.shake = Math.max(0, game.shake - dt * 1.6);
+  game.dmgFlash = Math.max(0, game.dmgFlash - dt * 2.4);
+  game.goldFlash = Math.max(0, game.goldFlash - dt * 2.4);
+  game.hpPulse = Math.max(0, game.hpPulse - dt * 4);
+  game.stonePulse = Math.max(0, game.stonePulse - dt * 4);
+  game.coreFlash = Math.max(0, game.coreFlash - dt * 2);
+
+  updateParticles(dt);
+  updateFloats(dt);
+
+  if (game.state === 'playing' && !game.encOpen) {
+    updatePlaying(dt);
+    updateCamera(dt);
+  }
+}
+
+// ============================== РЕНДЕР ==============================
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function text(str, x, y, color, size, align, bold) {
+  ctx.fillStyle = color;
+  ctx.font = (bold ? 'bold ' : '') + size + 'px ui-monospace, "Courier New", monospace';
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(str, x, y);
+}
+
+function drawArenaBg() {
+  // Фон в мировых координатах (parallax)
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+
+  const pulse = 0.5 + 0.5 * Math.sin(game.t * 0.8);
+  ctx.strokeStyle = 'rgba(40,60,90,' + (0.15 + pulse * 0.08) + ')';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let c = 0; c <= WORLD_COLS; c++) {
+    ctx.moveTo(c * CELL + 0.5, 0);
+    ctx.lineTo(c * CELL + 0.5, WORLD_H);
+  }
+  for (let r = 0; r <= WORLD_ROWS; r++) {
+    ctx.moveTo(0, r * CELL + 0.5);
+    ctx.lineTo(WORLD_W, r * CELL + 0.5);
+  }
+  ctx.stroke();
+
+  ctx.strokeStyle = 'rgba(60,100,160,0.55)';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(1.5, 1.5, WORLD_W - 3, WORLD_H - 3);
+}
+
+function drawCore() {
+  const x = cellX(CORE.c0), y = cellY(CORE.r0);
+  const w = (CORE.c1 - CORE.c0 + 1) * CELL;
+  const h = (CORE.r1 - CORE.r0 + 1) * CELL;
+  const pulse = 0.5 + 0.5 * Math.sin(game.t * 2.2);
+  const lvl = game.coreLevel;
+  const grow = (lvl - 1) * 3;
+  const hpPct = game.coreHp / game.coreMaxHp;
+
+  ctx.save();
+  ctx.shadowColor = 'rgba(90,150,255,' + (0.4 + pulse * 0.4) + ')';
+  ctx.shadowBlur = 24 + pulse * 14 + lvl * 4;
+  const g = ctx.createLinearGradient(x, y, x + w, y + h);
+  g.addColorStop(0, '#1a2840');
+  g.addColorStop(1, '#2a3f5f');
+  ctx.fillStyle = g;
+  rr(x + 6 - grow, y + 6 - grow, w - 12 + grow * 2, h - 12 + grow * 2, 10);
+  ctx.fill();
+  ctx.restore();
+
+  const borderAlpha = game.coreFlash > 0 ? 1 : (0.6 + pulse * 0.4);
+  ctx.strokeStyle = 'rgba(140,190,255,' + borderAlpha + ')';
+  ctx.lineWidth = 2 + lvl * 0.3;
+  rr(x + 6 - grow, y + 6 - grow, w - 12 + grow * 2, h - 12 + grow * 2, 10);
+  ctx.stroke();
+
+  const cx = x + w / 2, cy = y + h / 2;
+  const diamondR = 20 + lvl * 3;
+  ctx.save();
+  ctx.shadowColor = 'rgba(160,200,255,' + (0.5 + pulse * 0.5) + ')';
+  ctx.shadowBlur = 20 + lvl * 3;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - diamondR - 4);
+  ctx.lineTo(cx + diamondR * 0.7, cy);
+  ctx.lineTo(cx, cy + diamondR + 4);
+  ctx.lineTo(cx - diamondR * 0.7, cy);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(140,200,255,' + (0.55 + pulse * 0.4) + ')';
+  ctx.fill();
+  ctx.restore();
+  ctx.strokeStyle = '#cfe6ff';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // HP bar над ядром
+  const bw = 90, bh = 8;
+  const bx = cx - bw / 2, by = cy - diamondR - 28;
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  rr(bx, by, bw, bh, 4); ctx.fill();
+  ctx.fillStyle = hpPct > 0.5 ? '#4ad07a' : (hpPct > 0.25 ? '#e0c04a' : '#e04a4a');
+  rr(bx, by, bw * hpPct, bh, 4); ctx.fill();
+  ctx.strokeStyle = 'rgba(120,180,255,0.8)';
+  ctx.lineWidth = 1;
+  rr(bx, by, bw, bh, 4); ctx.stroke();
+  text('ЯДРО УР.' + lvl, cx, by - 4, '#a8c8ff', 11, 'center', true);
+}
+
+function drawModuleShape(m, x, y) {
+  const col = MODULES[m.type].color;
+  const cx = x + CELL / 2, cy = y + CELL / 2;
+
+  if (m.type === 'wall') {
+    const dmgPct = m.hp !== undefined ? m.hp / m.maxHp : 1;
+    ctx.fillStyle = col;
+    ctx.fillRect(x + 7, y + 8, CELL - 14, CELL - 16);
+    // Кладка
+    ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x + 7, cy - 2); ctx.lineTo(x + CELL - 7, cy - 2);
+    ctx.moveTo(x + 7, cy + 6); ctx.lineTo(x + CELL - 7, cy + 6);
+    ctx.moveTo(cx, y + 8); ctx.lineTo(cx, cy - 2);
+    ctx.moveTo(cx - 10, cy - 2); ctx.lineTo(cx - 10, cy + 6);
+    ctx.moveTo(cx + 10, cy - 2); ctx.lineTo(cx + 10, cy + 6);
+    ctx.moveTo(cx, cy + 6); ctx.lineTo(cx, y + CELL - 8);
+    ctx.stroke();
+    // Трещины при повреждении
+    if (dmgPct < 0.7) {
+      ctx.strokeStyle = 'rgba(20,10,5,' + (0.4 + (1 - dmgPct) * 0.5) + ')';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(x + 12, y + 12); ctx.lineTo(x + 20, y + 22); ctx.lineTo(x + 16, y + 30);
+      ctx.moveTo(x + CELL - 12, y + 14); ctx.lineTo(x + CELL - 22, y + 24);
+      ctx.stroke();
+    }
+    // HP bar
+    if (dmgPct < 1) {
+      const bw = CELL - 14, bh = 4;
+      const bx = x + 7, by = y + 4;
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(bx, by, bw, bh);
+      ctx.fillStyle = dmgPct > 0.5 ? '#6ee06e' : (dmgPct > 0.25 ? '#e0c04a' : '#e05a4a');
+      ctx.fillRect(bx, by, bw * dmgPct, bh);
+    }
+  } else if (m.type === 'tower') {
+    ctx.fillStyle = col;
+    ctx.fillRect(x + 10, y + 14, CELL - 20, CELL - 20);
+    for (let i = 0; i < 3; i++) ctx.fillRect(x + 10 + i * 10, y + 8, 7, 8);
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.fillRect(x + 18, y + 22, 5, 6);
+    ctx.fillRect(x + 25, y + 22, 5, 6);
+    // Пушка
+    ctx.fillStyle = 'rgba(20,15,5,0.7)';
+    ctx.fillRect(cx - 3, y + 16, 6, 14);
+  } else if (m.type === 'forge') {
+    ctx.fillStyle = col;
+    ctx.fillRect(x + 8, y + 12, CELL - 16, CELL - 20);
+    const glow = 0.6 + 0.4 * Math.sin(game.t * 6 + m.c * 3);
+    ctx.save();
+    ctx.shadowColor = '#ff8030';
+    ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + 8);
+    ctx.quadraticCurveTo(cx - 8, cy + 2, cx - 4, cy - 6);
+    ctx.quadraticCurveTo(cx, cy - 4, cx, cy - 10);
+    ctx.quadraticCurveTo(cx, cy - 4, cx + 4, cy - 6);
+    ctx.quadraticCurveTo(cx + 8, cy + 2, cx, cy + 8);
+    ctx.fillStyle = 'rgba(255,160,60,' + glow + ')';
+    ctx.fill();
+    ctx.restore();
+  } else if (m.type === 'heal') {
+    ctx.fillStyle = col;
+    ctx.fillRect(x + 10, y + 10, CELL - 20, CELL - 20);
+    ctx.fillStyle = 'rgba(10,20,16,0.7)';
+    ctx.fillRect(cx - 3, cy - 10, 6, 20);
+    ctx.fillRect(cx - 10, cy - 3, 20, 6);
+    const pulse = 0.5 + 0.5 * Math.sin(game.t * 4 + m.r);
+    ctx.save();
+    ctx.shadowColor = '#3ad0a0';
+    ctx.shadowBlur = 10 * pulse;
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.3 + pulse * 0.4) + ')';
+    ctx.fillRect(cx - 2, cy - 9, 4, 18);
+    ctx.fillRect(cx - 9, cy - 2, 18, 4);
+    ctx.restore();
+  }
+}
+
+function drawModules() {
+  for (const k in game.modules) {
+    const m = game.modules[k];
+    const x = cellX(m.c), y = cellY(m.r);
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    rr(x + 5, y + 8, CELL - 10, CELL - 10, 7);
+    ctx.fill();
+    drawModuleShape(m, x, y);
+    if (m.flash > 0) {
+      ctx.fillStyle = 'rgba(255,220,140,' + (m.flash * 0.55) + ')';
+      rr(x + 5, y + 5, CELL - 10, CELL - 10, 7);
+      ctx.fill();
+    }
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    for (let i = 0; i < m.level; i++) {
+      ctx.beginPath();
+      ctx.arc(x + 12 + i * 7.5, y + CELL - 9, 2.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+function drawBuildOverlay() {
+  const blink = 0.55 + 0.45 * Math.sin(game.t * 7);
+  const maxR = maxRing();
+
+  for (let c = 0; c < WORLD_COLS; c++) {
+    for (let r = 0; r < WORLD_ROWS; r++) {
+      const dist = cellDistance(c, r);
+      if (dist === 0) continue;
+      const x = cellX(c), y = cellY(r);
+      const key = c + ',' + r;
+      const m = game.modules[key];
+
+      if (dist > maxR) {
+        // Недоступно (за пределами радиуса ядра)
+        if (dist === maxR + 1) {
+          ctx.strokeStyle = 'rgba(60,40,80,0.35)';
+          ctx.setLineDash([4, 4]);
+          ctx.lineWidth = 1;
+          ctx.strokeRect(x + 2.5, y + 2.5, CELL - 5, CELL - 5);
+          ctx.setLineDash([]);
+        }
+        continue;
+      }
+
+      if (m) {
+        const cost = MODULES[m.type].cost + m.level * 3;
+        const ok = game.stones >= cost && m.level < 5;
+        ctx.fillStyle = ok ? 'rgba(224,180,74,' + (0.10 * blink + 0.06) + ')' : 'rgba(140,140,140,0.05)';
+        ctx.fillRect(x + 2, y + 2, CELL - 4, CELL - 4);
+        ctx.strokeStyle = ok ? 'rgba(224,180,74,' + (0.6 * blink + 0.25) + ')' : 'rgba(120,120,120,0.35)';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(x + 2.5, y + 2.5, CELL - 5, CELL - 5);
+        if (m.level < 5) {
+          ctx.fillStyle = ok ? 'rgba(255,220,140,0.9)' : 'rgba(180,120,120,0.7)';
+          ctx.font = 'bold 11px monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText(cost, x + CELL / 2, y + CELL - 4);
+        }
+      } else {
+        const type = MOD_ORDER[game.buildSel];
+        const cost = MODULES[type].cost;
+        let ok = game.stones >= cost;
+        if (type === 'tower' && countTowers() >= game.stats.maxTowers) ok = false;
+        ctx.fillStyle = ok ? 'rgba(80,220,160,' + (0.10 * blink + 0.05) + ')' : 'rgba(220,80,80,' + (0.08 * blink + 0.03) + ')';
+        ctx.fillRect(x + 2, y + 2, CELL - 4, CELL - 4);
+        ctx.strokeStyle = ok ? 'rgba(80,220,160,' + (0.5 * blink + 0.15) + ')' : 'rgba(220,80,80,0.35)';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(x + 2.5, y + 2.5, CELL - 5, CELL - 5);
+      }
+    }
+  }
+  ctx.textAlign = 'left';
+
+  const hc = Math.floor(mouse.wx / CELL);
+  const hr = Math.floor(mouse.wy / CELL);
+  if (isBuildable(hc, hr) && !game.modules[hc + ',' + hr]) {
+    const col = MODULES[MOD_ORDER[game.buildSel]].color;
+    ctx.globalAlpha = 0.5;
+    ctx.fillStyle = col;
+    rr(cellX(hc) + 5, cellY(hr) + 5, CELL - 10, CELL - 10, 7);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawPlayer() {
+  const p = game.player;
+  if (game.state === 'dead') return;
+
+  for (const tr of p.trail) {
+    if (tr.life <= 0) continue;
+    ctx.globalAlpha = tr.life * 1.3;
+    ctx.beginPath();
+    ctx.arc(tr.x, tr.y, 10 * tr.life + 2, 0, Math.PI * 2);
+    ctx.fillStyle = '#6fa8ff';
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  if (p.swing > 0) {
+    const a = p.swing / 0.18;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 62, p.ang - 0.9 - (1 - a) * 0.6, p.ang + 0.9 + (1 - a) * 0.6);
+    ctx.strokeStyle = 'rgba(160,210,255,' + (a * 0.85) + ')';
+    ctx.lineWidth = 5;
+    ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.shadowColor = 'rgba(140,200,255,0.6)';
+  ctx.shadowBlur = 14;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, 16, 0, Math.PI * 2);
+  ctx.fillStyle = '#e8f1ff';
+  ctx.fill();
+  ctx.restore();
+  ctx.strokeStyle = '#4d7fc4';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, 16, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(p.x, p.y);
+  ctx.lineTo(p.x + Math.cos(p.ang) * 22, p.y + Math.sin(p.ang) * 22);
+  ctx.strokeStyle = '#6fa8ff';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+}
+
+function drawEnemies() {
+  for (let i = 0; i < game.enemies.length; i++) {
+    const e = game.enemies[i];
+    const telegraph = e.shootCd < 0.5 && e.shootCd > 0;
+    const wobAmt = 1.6 + (telegraph ? 2.4 : 0);
+    const wob = Math.sin(e.wob * (telegraph ? 2 : 1)) * wobAmt;
+
+    if (e.isBoss && e.shootCd < 0.7) {
+      const a = 1 - e.shootCd / 0.7;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.r + 14 + a * 12, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(255,80,80,' + (a * 0.7) + ')';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    }
+
+    if (e.isElite || e.isBoss) {
+      ctx.save();
+      ctx.shadowColor = e.isBoss ? '#ff4a8a' : '#ffe080';
+      ctx.shadowBlur = 16 + Math.sin(game.t * 5) * 6;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y + wob, e.r + 3, 0, Math.PI * 2);
+      ctx.strokeStyle = e.isBoss ? '#ff8ab0' : '#ffe080';
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    ctx.beginPath();
+    ctx.arc(e.x, e.y + wob, e.r, 0, Math.PI * 2);
+    ctx.fillStyle = e.flash > 0 ? '#ffffff' : e.color;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    if (telegraph && !e.isBoss) {
+      ctx.globalAlpha = 0.35 * (1 - e.shootCd / 0.5);
+      ctx.beginPath();
+      ctx.arc(e.x, e.y + wob, e.r + 5, 0, Math.PI * 2);
+      ctx.fillStyle = '#ff3030';
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    const dx = game.player.x - e.x, dy = game.player.y - e.y;
+    const d = Math.hypot(dx, dy) || 1;
+    ctx.beginPath();
+    ctx.arc(e.x + dx / d * e.r * 0.35, e.y + wob + dy / d * e.r * 0.35, e.r * 0.22, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(10,12,16,0.9)';
+    ctx.fill();
+
+    const pct = clamp(e.hp / e.maxHp, 0, 1);
+    if (pct < 1 || e.isElite) {
+      const bw = e.r * 2.4, bx = e.x - bw / 2, by = e.y - e.r - 10 + wob;
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(bx, by, bw, 4);
+      ctx.fillStyle = pct > 0.5 ? '#6ee06e' : (pct > 0.25 ? '#e0c04a' : '#e05a4a');
+      ctx.fillRect(bx, by, bw * pct, 4);
+    }
+  }
+}
+
+function drawShots() {
+  for (let i = 0; i < game.shots.length; i++) {
+    const s = game.shots[i];
+    const rt = ROCK_TYPES[s.type];
+    const ddx = s.tx - s.x, ddy = s.ty - s.y;
+    const dd = Math.hypot(ddx, ddy) || 1;
+    const ux = ddx / dd, uy = ddy / dd;
+    for (let j = 1; j <= 4; j++) {
+      const t = j / 5;
+      ctx.globalAlpha = 0.18 * (1 - t);
+      ctx.beginPath();
+      ctx.arc(s.x - ux * 14 * t, s.y - uy * 14 * t, rt.r * (1 - t * 0.4), 0, Math.PI * 2);
+      ctx.fillStyle = rt.color;
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.save();
+    if (s.type === 'glow') { ctx.shadowColor = '#7cf6c8'; ctx.shadowBlur = 14; }
+    else if (s.type === 'heavy') { ctx.shadowColor = '#a97b4e'; ctx.shadowBlur = 6; }
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, rt.r, 0, Math.PI * 2);
+    ctx.fillStyle = rt.color;
+    ctx.fill();
+    ctx.restore();
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  for (let i = 0; i < game.tshots.length; i++) {
+    const s = game.tshots[i];
+    ctx.save();
+    ctx.shadowColor = '#ffe08a';
+    ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, 4.5, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffe08a';
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawRocks() {
+  for (let i = 0; i < game.rocks.length; i++) {
+    const r = game.rocks[i];
+    const rt = ROCK_TYPES[r.type];
+    const bob = Math.sin(game.t * 3 + r.t) * 1.8;
+    let scale = 1, alpha = 1;
+    if (r.spawnT > 0) {
+      const k = clamp((0.35 - r.spawnT) / 0.2, 0, 1);
+      scale = k + Math.sin(k * Math.PI) * 0.18;
+      alpha = Math.min(1, k * 3);
+    }
+    ctx.globalAlpha = alpha;
+    const pr = rt.r * scale;
+    ctx.save();
+    if (r.type === 'glow') { ctx.shadowColor = '#7cf6c8'; ctx.shadowBlur = 16; }
+    ctx.beginPath();
+    ctx.arc(r.x, r.y + bob, pr, 0, Math.PI * 2);
+    ctx.fillStyle = rt.color;
+    ctx.fill();
+    ctx.restore();
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    if (r.type === 'heavy') {
+      ctx.beginPath();
+      ctx.arc(r.x - 2, r.y + bob - 2, pr * 0.35, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(0,0,0,0.3)';
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawParticles() {
+  for (let i = 0; i < game.parts.length; i++) {
+    const pt = game.parts[i];
+    const a = clamp(pt.life / pt.max, 0, 1);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = pt.color;
+    ctx.fillRect(pt.x - pt.size / 2, pt.y - pt.size / 2, pt.size, pt.size);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawFloats() {
+  for (const f of game.floats) {
+    const a = clamp(f.life / f.max, 0, 1);
+    ctx.globalAlpha = a;
+    text(f.txt, f.x, f.y, f.color, f.size, 'center', true);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawBossBar() {
+  let boss = null;
+  for (const e of game.enemies) if (e.isBoss && !e.dead) { boss = e; break; }
+  if (!boss) return;
+  const bw = W - 240, bh = 16, bx = 120, by = GY + 12;
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  rr(bx, by, bw, bh, 5); ctx.fill();
+  const pct = clamp(boss.hp / boss.maxHp, 0, 1);
+  ctx.save();
+  ctx.shadowColor = '#ff4a8a';
+  ctx.shadowBlur = 12;
+  ctx.fillStyle = '#ff4a8a';
+  rr(bx, by, bw * pct, bh, 5); ctx.fill();
+  ctx.restore();
+  ctx.strokeStyle = '#ff8ab0';
+  ctx.lineWidth = 2;
+  rr(bx, by, bw, bh, 5); ctx.stroke();
+  text('МИНИ-БОСС', bx + bw / 2, by - 4, '#ff8ab0', 12, 'center', true);
+}
+
+function drawMinimap() {
+  const mw = 200, mh = 130;
+  const mx = W - mw - 12, my = H - mh - 12;
+  ctx.fillStyle = 'rgba(6,10,16,0.85)';
+  rr(mx, my, mw, mh, 8); ctx.fill();
+  ctx.strokeStyle = 'rgba(60,100,160,0.6)';
+  ctx.lineWidth = 1.5;
+  rr(mx, my, mw, mh, 8); ctx.stroke();
+  text('КАРТА', mx + 8, my + 14, '#6f8bb0', 10, 'left', true);
+
+  const sx = mw / WORLD_W, sy = mh / WORLD_H;
+
+  // Границы арены
+  ctx.strokeStyle = 'rgba(60,100,160,0.7)';
+  ctx.strokeRect(mx + 4, my + 4, mw - 8, mh - 8);
+
+  // Ядро
+  ctx.fillStyle = '#7fb0ff';
+  ctx.beginPath();
+  ctx.arc(mx + CORE_WX * sx, my + CORE_WY * sy, 4, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Камни
+  ctx.fillStyle = '#cfd6e0';
+  for (const r of game.rocks) {
+    ctx.fillRect(mx + r.x * sx - 1, my + r.y * sy - 1, 2, 2);
+  }
+
+  // Враги
+  for (const e of game.enemies) {
+    if (e.dead) continue;
+    ctx.fillStyle = e.isBoss ? '#ff4a8a' : (e.isElite ? '#ffe080' : '#e05a4f');
+    ctx.beginPath();
+    ctx.arc(mx + e.x * sx, my + e.y * sy, e.isBoss ? 3.5 : 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Игрок
+  ctx.fillStyle = '#e8f1ff';
+  ctx.beginPath();
+  ctx.arc(mx + game.player.x * sx, my + game.player.y * sy, 3, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Камера
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(mx + cam.x * sx, my + cam.y * sy, W * sx, H * sy);
+}
+
+function drawHUD() {
+  ctx.fillStyle = '#0a0e15';
+  ctx.fillRect(0, 0, W, GY);
+  ctx.strokeStyle = '#1b2432';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, GY - 0.5);
+  ctx.lineTo(W, GY - 0.5);
+  ctx.stroke();
+
+  // HP
+  const hpw = 210, hpx = 14, hpy = 12;
+  const hpScale = 1 + game.hpPulse * 0.06;
+  ctx.save();
+  ctx.translate(hpx + hpw / 2, hpy + 8);
+  ctx.scale(hpScale, hpScale);
+  ctx.translate(-hpw / 2, -8);
+  ctx.fillStyle = '#161c25';
+  rr(0, 0, hpw, 16, 4); ctx.fill();
+  const pct = clamp(game.hp / game.maxHp, 0, 1);
+  ctx.fillStyle = pct > 0.5 ? '#4ad07a' : (pct > 0.25 ? '#e0c04a' : '#e04a4a');
+  rr(0, 0, Math.max(2, hpw * pct), 16, 4); ctx.fill();
+  ctx.strokeStyle = '#2a3547';
+  rr(0, 0, hpw, 16, 4); ctx.stroke();
+  ctx.fillStyle = '#08111a';
+  ctx.font = 'bold 12px ui-monospace, monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('HP ' + Math.ceil(game.hp) + '/' + Math.round(game.maxHp), 8, 13);
+  ctx.restore();
+
+  // Core HP
+  const cw = 180, chx = 235, chy = 12;
+  ctx.fillStyle = '#0f1828';
+  rr(chx, chy, cw, 16, 4); ctx.fill();
+  const cpct = clamp(game.coreHp / game.coreMaxHp, 0, 1);
+  ctx.fillStyle = cpct > 0.5 ? '#7fb0ff' : (cpct > 0.25 ? '#e0a04a' : '#e04a4a');
+  rr(chx, chy, Math.max(2, cw * cpct), 16, 4); ctx.fill();
+  ctx.strokeStyle = '#2a3547';
+  rr(chx, chy, cw, 16, 4); ctx.stroke();
+  ctx.fillStyle = '#08111a';
+  ctx.font = 'bold 12px ui-monospace, monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('ЯДРО ' + Math.ceil(game.coreHp) + '/' + Math.round(game.coreMaxHp) + ' (ур.' + game.coreLevel + ')', chx + 6, chy + 13);
+
+  // Камни
+  const stScale = 1 + game.stonePulse * 0.2;
+  ctx.save();
+  ctx.translate(440, 20);
+  ctx.scale(stScale, stScale);
+  ctx.beginPath();
+  ctx.arc(0, 0, 7, 0, Math.PI * 2);
+  ctx.fillStyle = '#cfd6e0'; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.stroke();
+  ctx.restore();
+  text('× ' + game.stones, 454, 26, '#dfe7f2', 16, 'left', true);
+
+  // Волна
+  text('ВОЛНА ' + Math.max(1, game.wave), 560, 26, '#8fb6e8', 14, 'left', true);
+  if (game.waveModifier !== 'normal') {
+    const n = { rain: 'ДОЖДЬ', fast: 'БЫСТРАЯ', greedy: 'ЖАДНАЯ', quiet: 'ТИХАЯ' }[game.waveModifier] || '';
+    text('[' + n + ']', 560, 44, '#e0b44a', 10, 'left', false);
+  }
+
+  // Счёт/рекорд
+  text('СЧЁТ ' + game.score, 680, 26, '#c9d4e2', 13, 'left', false);
+  text('РЕКОРД ' + game.best, 800, 26, '#6f8bb0', 13, 'left', false);
+
+  // Фаза подготовки
+  if (game.state === 'playing' && !game.waveActive) {
+    if (game.prepMode === 'timer') {
+      text('ПОДГОТОВКА ' + Math.ceil(game.prepTimer) + 'с', 800, 44, '#8fd0a8', 12, 'left', true);
+    } else {
+      text('ПОДГОТОВКА (без таймера)', 800, 44, '#8fd0a8', 12, 'left', true);
+    }
+    text('Space — начать волну' + (game.prepMode === 'timer' ? ' (+3 камня)' : ''), 560, 44, '#7a8ea6', 11, 'left', false);
+  }
+
+  // Подсказки управления
+  text('WASD/стрелки — ходьба | ЛКМ — удар | E — поднять | B — стройка | 1-4 — модуль | U — ядро | Tab — энциклопедия | R — рестарт',
+       14, 54, '#54657e', 10, 'left', false);
+
+  // Реликвии/проклятия — правый край
+  if (game.relics.length > 0 || game.curses.length > 0) {
+    const startY = GY + 30;
+    let idx = 0;
+    for (const rel of game.relics) {
+      text('✦ ' + rel, W - 218, startY + idx * 16, '#ffd970', 11, 'right', true);
+      idx++;
+    }
+    for (const cur of game.curses) {
+      text('☠ ' + cur, W - 218, startY + idx * 16, '#ff5a5a', 11, 'right', true);
+      idx++;
+    }
+  }
+
+  // Сообщение
+  if (game.msgT > 0) {
+    const a = clamp(game.msgT / 0.6, 0, 1);
+    ctx.globalAlpha = a;
+    text(game.msg, W / 2, 130, '#ffffff', 26, 'center', true);
+    ctx.globalAlpha = 1;
+  }
+
+  // Панель строительства
+  if (game.buildMode) {
+    const by = H - 128;
+    ctx.fillStyle = 'rgba(8,11,16,0.9)';
+    rr(10, by - 10, 660, 62, 8); ctx.fill();
+    ctx.strokeStyle = '#26333f';
+    rr(10, by - 10, 660, 62, 8); ctx.stroke();
+    for (let i = 0; i < MOD_ORDER.length; i++) {
+      const t = MOD_ORDER[i];
+      const m = MODULES[t];
+      const bx = 20 + i * 158;
+      const sel = game.buildSel === i;
+      let afford = game.stones >= m.cost;
+      if (t === 'tower' && countTowers() >= game.stats.maxTowers) afford = false;
+      ctx.fillStyle = sel ? 'rgba(255,255,255,0.13)' : 'rgba(255,255,255,0.03)';
+      rr(bx, by, 148, 42, 6); ctx.fill();
+      ctx.strokeStyle = sel ? m.color : '#2a3542';
+      ctx.lineWidth = sel ? 2 : 1;
+      rr(bx, by, 148, 42, 6); ctx.stroke();
+      text((i + 1) + '. ' + m.name, bx + 10, by + 18, sel ? m.color : '#9aa9bd', 12, 'left', true);
+      text(m.cost + ' камней', bx + 10, by + 34, afford ? '#8fd0a8' : '#c46a6a', 11, 'left', false);
+    }
+    text('B — выйти | U — улучшить ядро', 680, by + 24, '#7a8ea6', 12, 'left', true);
+  }
+}
+
+function drawStartScreen() {
+  ctx.fillStyle = 'rgba(4,6,10,0.92)';
+  ctx.fillRect(0, 0, W, H);
+
+  const vg = ctx.createRadialGradient(W / 2, H / 2, 100, W / 2, H / 2, 600);
+  vg.addColorStop(0, 'rgba(60,100,180,0.12)');
+  vg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.shadowColor = 'rgba(120,180,255,0.7)';
+  ctx.shadowBlur = 20;
+  text('КИДАЙТЕ В МЕНЯ КАМНИ,', W / 2, 110, '#e8f1ff', 34, 'center', true);
+  text('Я ПОСТРОЮ ИЗ НИХ ЗАМОК', W / 2, 152, '#7fb0ff', 34, 'center', true);
+  ctx.restore();
+
+  text('Экшен-рогалик с осадой, камнемётами и строительством замка', W / 2, 190, '#7a8ea6', 13, 'center', false);
+
+  const lines = [
+    'WASD / стрелки — движение',
+    'ЛКМ — удар в сторону курсора',
+    'E — подобрать камни рядом',
+    'B — режим строительства, 1-4 — модуль, ЛКМ — поставить',
+    'U — улучшить ядро (нужны камни и модули)',
+    'Space — начать волну (во время подготовки)',
+    'Tab — энциклопедия',
+    'R — рестарт после смерти'
+  ];
+  for (let i = 0; i < lines.length; i++) {
+    text(lines[i], W / 2, 232 + i * 22, '#96a8c0', 13, 'center', false);
+  }
+
+  // Переключатель режима
+  const bx = W / 2 - 160, by = 440;
+  text('Режим подготовки между волнами:', W / 2, by - 8, '#8fa3bd', 13, 'center', false);
+
+  const timerSel = game.prepMode === 'timer';
+  ctx.fillStyle = timerSel ? 'rgba(80,140,220,0.35)' : 'rgba(20,28,40,0.85)';
+  rr(bx, by, 150, 36, 8); ctx.fill();
+  ctx.strokeStyle = timerSel ? '#7fb0ff' : '#2b3a50';
+  ctx.lineWidth = timerSel ? 2 : 1;
+  rr(bx, by, 150, 36, 8); ctx.stroke();
+  text('С ТАЙМЕРОМ', bx + 75, by + 24, timerSel ? '#e8f1ff' : '#8fa3bd', 13, 'center', true);
+
+  ctx.fillStyle = !timerSel ? 'rgba(80,140,220,0.35)' : 'rgba(20,28,40,0.85)';
+  rr(bx + 170, by, 150, 36, 8); ctx.fill();
+  ctx.strokeStyle = !timerSel ? '#7fb0ff' : '#2b3a50';
+  ctx.lineWidth = !timerSel ? 2 : 1;
+  rr(bx + 170, by, 150, 36, 8); ctx.stroke();
+  text('БЕЗ ТАЙМЕРА', bx + 170 + 75, by + 24, !timerSel ? '#e8f1ff' : '#8fa3bd', 13, 'center', true);
+
+  text('Таймер: 20с (ранние волны) → 15с. Без таймера — ждёте, пока не нажмёте Space.',
+       W / 2, by + 60, '#5c6f88', 11, 'center', false);
+
+  const pulse = 0.55 + 0.45 * Math.sin(performance.now() / 320);
+  ctx.globalAlpha = pulse;
+  text('SPACE / ENTER / КЛИК — НАЧАТЬ', W / 2, 540, '#9fd0ff', 18, 'center', true);
+  ctx.globalAlpha = 1;
+
+  text('РЕКОРД: ' + game.best + '   ЛУЧШАЯ ВОЛНА: ' + game.bestWave, W / 2, 580, '#5c7290', 12, 'center', false);
+  text('TAB — энциклопедия', W / 2, 604, '#7a8ea6', 12, 'center', false);
+}
+
+function drawUpgradeScreen() {
+  ctx.fillStyle = 'rgba(4,6,10,0.88)';
+  ctx.fillRect(0, 0, W, H);
+
+  text('ВОЛНА ' + game.wave + ' ОТБИТА', W / 2, 100, '#8fd0a8', 32, 'center', true);
+  text('Выберите улучшение (1 / 2 / 3 или клик)', W / 2, 138, '#7a8ea6', 14, 'center', false);
+
+  const cw = 280, ch = 260;
+  const totalW = cw * 3 + 40;
+  const startX = (W - totalW) / 2;
+  const cy = 190;
+
+  for (let i = 0; i < game.choices.length; i++) {
+    const ch_ = game.choices[i];
+    const u = ch_.upgrade;
+    const rar = RARITY_COLOR[ch_.rarity];
+    const x = startX + i * (cw + 20);
+    const hover = mouse.x > x && mouse.x < x + cw && mouse.y > cy && mouse.y < cy + ch;
+
+    ctx.save();
+    if (hover) { ctx.shadowColor = rar; ctx.shadowBlur = 20; }
+    ctx.fillStyle = hover ? 'rgba(30,42,60,0.98)' : 'rgba(15,22,32,0.96)';
+    rr(x, cy, cw, ch, 14); ctx.fill();
+    ctx.restore();
+
+    ctx.strokeStyle = hover ? rar : 'rgba(' + (ch_.rarity === 'epic' ? '198,111,255' : ch_.rarity === 'rare' ? '111,168,255' : '143,163,189') + ',0.7)';
+    ctx.lineWidth = hover ? 3 : 2;
+    rr(x, cy, cw, ch, 14); ctx.stroke();
+
+    ctx.fillStyle = rar;
+    rr(x + 14, cy + 14, 130, 26, 6); ctx.fill();
+    text(RARITY_NAME[ch_.rarity], x + 14 + 65, cy + 32, '#0a0f16', 12, 'center', true);
+
+    ctx.save();
+    ctx.shadowColor = rar;
+    ctx.shadowBlur = 16;
+    text(u.sym, x + cw / 2, cy + 112, rar, 44, 'center', true);
+    ctx.restore();
+
+    text(u.name, x + cw / 2, cy + 158, '#e8f1ff', 17, 'center', true);
+    text(u.desc(RARITY_MULT[ch_.rarity]), x + cw / 2, cy + 192, '#9fb3cc', 13, 'center', false);
+
+    const typeName = u.type === 'player' ? 'ИГРОК' : (u.type === 'castle' ? 'ЗАМОК' : 'ЭКОНОМИКА');
+    text(typeName, x + cw / 2, cy + 222, '#5c7290', 11, 'center', false);
+    text('[' + (i + 1) + ']', x + cw / 2, cy + ch - 12, rar, 15, 'center', true);
+  }
+
+  if (game.triggeredSynergies.size > 0) {
+    let y = 490;
+    text('СИНЕРГИИ:', W / 2, y, '#ffd970', 13, 'center', true);
+    let idx = 0;
+    for (const s of game.triggeredSynergies) {
+      text('★ ' + s, W / 2, y + 20 + idx * 18, '#ffb840', 12, 'center', false);
+      idx++;
+    }
+  }
+}
+
+function drawDeathScreen() {
+  ctx.fillStyle = 'rgba(35,4,8,0.85)';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.shadowColor = 'rgba(255,80,80,0.7)';
+  ctx.shadowBlur = 20;
+  text('ЗАМОК ПАЛ', W / 2, 180, '#ff6a5a', 48, 'center', true);
+  ctx.restore();
+
+  const reason = game.deadReason === 'ядро' ? 'ЯДРО РАЗРУШЕНО' : 'ИГРОК ПОГИБ';
+  text(reason, W / 2, 226, '#ff9a8a', 20, 'center', true);
+
+  text('Волна: ' + game.wave + '   Убийств: ' + game.kills, W / 2, 282, '#c9d4e2', 18, 'center', false);
+  text('Счёт: ' + game.score, W / 2, 320, '#e8f1ff', 24, 'center', true);
+
+  if (game.score >= game.best && game.score > 0) {
+    text('НОВЫЙ РЕКОРД!', W / 2, 356, '#ffd970', 18, 'center', true);
+  } else {
+    text('Рекорд: ' + game.best + '   Лучшая волна: ' + game.bestWave, W / 2, 356, '#8fb6e8', 15, 'center', false);
+  }
+
+  const pulse = 0.55 + 0.45 * Math.sin(performance.now() / 320);
+  ctx.globalAlpha = pulse;
+  text('НАЖМИТЕ R ДЛЯ НОВОГО ЗАБЕГА', W / 2, 440, '#ffffff', 22, 'center', true);
+  ctx.globalAlpha = 1;
+}
+
+// ---------- ЭНЦИКЛОПЕДИЯ ----------
+const ENC_TABS = ['Модули', 'Враги', 'Камни', 'Улучшения', 'Реликвии', 'Ядро', 'Управление'];
+
+function drawEncIcon(icon, x, y, color) {
+  ctx.fillStyle = color;
+  ctx.font = 'bold 20px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(icon, x, y);
+  ctx.textBaseline = 'alphabetic';
+}
+
+function renderEncContent(tab) {
+  const startX = 60, startY = 130, cw = W - 120;
+  let entries = [];
+
+  if (tab === 'Модули') {
+    for (const k of MOD_ORDER) {
+      const m = MODULES[k];
+      entries.push({ icon: m.sym, name: m.name, desc: m.desc,
+        stats: 'Стоимость: ' + m.cost + ' камней. Уровни: 1-5.' });
+    }
+  } else if (tab === 'Враги') {
+    for (const k in ENEMY_TYPES) {
+      const e = ENEMY_TYPES[k];
+      entries.push({ icon: '●', name: k.toUpperCase(), desc: e.desc,
+        stats: 'HP: ' + e.hp + ' | Скорость: ' + e.speed + ' | Урон: ' + ROCK_TYPES[e.rock].dmg });
+    }
+  } else if (tab === 'Камни') {
+    for (const k in ROCK_TYPES) {
+      const r = ROCK_TYPES[k];
+      entries.push({ icon: '◆', name: k.toUpperCase(), desc: r.desc,
+        stats: 'Урон: ' + r.dmg + ' | Ресурс: ' + r.stones + (r.heal ? ' | Лечит: +' + r.heal : '') });
+    }
+  } else if (tab === 'Улучшения') {
+    for (const u of UPGRADES) {
+      entries.push({ icon: u.sym, name: u.name, desc: u.desc(1),
+        stats: 'Тип: ' + (u.type === 'player' ? 'Игрок' : u.type === 'castle' ? 'Замок' : 'Экономика') +
+               '. Редкость умножает эффект.' });
+    }
+  } else if (tab === 'Реликвии') {
+    for (const r of RELICS) {
+      entries.push({ icon: r.sym, name: r.name, desc: r.desc,
+        stats: 'Постоянный эффект на забег.' });
+    }
+    for (const c of CURSES) {
+      entries.push({ icon: '☠', name: 'ПРОКЛЯТИЕ: ' + c.name, desc: c.desc,
+        stats: 'Побочный эффект при выборе эпического улучшения.' });
+    }
+  } else if (tab === 'Ядро') {
+    for (let i = 0; i < CORE_LEVELS.length; i++) {
+      const L = CORE_LEVELS[i];
+      const lvl = i + 1;
+      const stats = i === 0
+        ? 'Базовое. HP: 200, кольца: 1, лимит башен: 2.'
+        : 'Цена: ' + L.cost + ' камней, модулей: ' + L.reqModules +
+          ' | +HP: ' + L.hpAdd + ' | +Башни: ' + Math.round(L.towerDmg * 100) + '%' +
+          ' | Радиус лечения: ' + L.healRadius + ' | +HP игрока: ' + L.playerHp +
+          ' | Колец: ' + L.ring + ' | Лимит башен: ' + L.maxTowers;
+      entries.push({ icon: '★', name: 'УРОВЕНЬ ' + lvl, desc: i === 0 ? 'Стартовое ядро.' : 'Улучшение за камни и модули.',
+        stats });
+    }
+  } else if (tab === 'Управление') {
+    entries = [
+      { icon: '⌨', name: 'WASD / Стрелки', desc: 'Движение игрока', stats: 'Работает на любой раскладке (e.code).' },
+      { icon: '⌨', name: 'ЛКМ', desc: 'Удар в сторону курсора', stats: 'Ближний бой.' },
+      { icon: '⌨', name: 'E', desc: 'Подобрать камень рядом', stats: 'Автосбор в радиусе 26px.' },
+      { icon: '⌨', name: 'B', desc: 'Режим строительства', stats: 'Показывает доступные клетки.' },
+      { icon: '⌨', name: '1-4', desc: 'Выбор модуля', stats: 'Стена/Башня/Кузница/Лазарет.' },
+      { icon: '⌨', name: 'U', desc: 'Улучшить ядро', stats: 'Требует камни и модули.' },
+      { icon: '⌨', name: 'Space', desc: 'Начать волну / старт игры', stats: 'В режиме с таймером — +3 камня.' },
+      { icon: '⌨', name: 'Tab / Esc', desc: 'Энциклопедия', stats: 'Пауза + справка.' },
+      { icon: '⌨', name: 'R', desc: 'Рестарт после смерти', stats: 'С новым забегом.' }
+    ];
+  }
+
+  // Рисуем записи в 2 колонки
+  const cols = 2;
+  const cwEach = (cw - 20) / cols;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const ex = startX + col * (cwEach + 20);
+    const ey = startY + row * 78;
+    if (ey > H - 40) break;
+
+    ctx.fillStyle = 'rgba(20,30,45,0.7)';
+    rr(ex, ey, cwEach, 72, 8); ctx.fill();
+    ctx.strokeStyle = '#2b3a50';
+    ctx.lineWidth = 1;
+    rr(ex, ey, cwEach, 72, 8); ctx.stroke();
+
+    drawEncIcon(e.icon, ex + 22, ey + 22, '#ffd970');
+
+    text(e.name, ex + 44, ey + 20, '#e8f1ff', 13, 'left', true);
+    text(e.desc, ex + 44, ey + 38, '#9fb3cc', 11, 'left', false);
+    text(e.stats, ex + 44, ey + 54, '#7a8ea6', 10, 'left', false);
+  }
+}
+
+function renderEncyclopedia() {
+  ctx.fillStyle = 'rgba(5,7,12,0.95)';
+  ctx.fillRect(0, 0, W, H);
+
+  text('ЭНЦИКЛОПЕДИЯ', W / 2, 36, '#e8f1ff', 24, 'center', true);
+
+  const tw = 122, th = 30;
+  const totalTabsW = ENC_TABS.length * (tw + 4) - 4;
+  const tx0 = (W - totalTabsW) / 2;
+  for (let i = 0; i < ENC_TABS.length; i++) {
+    const tx = tx0 + i * (tw + 4);
+    const sel = i === game.encTab;
+    ctx.fillStyle = sel ? 'rgba(80,140,220,0.5)' : 'rgba(20,28,40,0.85)';
+    rr(tx, 70, tw, th, 6); ctx.fill();
+    ctx.strokeStyle = sel ? '#7fb0ff' : '#2b3a50';
+    ctx.lineWidth = sel ? 2 : 1;
+    rr(tx, 70, tw, th, 6); ctx.stroke();
+    text(ENC_TABS[i], tx + tw / 2, 70 + th / 2 + 4, sel ? '#e8f1ff' : '#8fa3bd', 11, 'center', true);
+  }
+
+  renderEncContent(ENC_TABS[game.encTab]);
+
+  text('Tab / Esc — закрыть  |  клик по вкладке — переключить', W / 2, H - 14, '#5c7290', 11, 'center', false);
+}
+
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#04060a';
+  ctx.fillRect(0, 0, W, H);
+
+  if (game.state === 'start') {
+    drawStartScreen();
+    if (game.encOpen) renderEncyclopedia();
+    return;
+  }
+
+  ctx.save();
+  if (game.shake > 0) {
+    const s = game.shake * 14;
+    ctx.translate((Math.random() - 0.5) * s, (Math.random() - 0.5) * s);
+  }
+
+  // Камера — мировые координаты
+  ctx.save();
+  ctx.translate(-cam.x, -cam.y);
+
+  drawArenaBg();
+
+  if (game.buildMode && game.state === 'playing') drawBuildOverlay();
+  drawCore();
+  drawModules();
+  drawRocks();
+  drawEnemies();
+  drawShots();
+  drawPlayer();
+  drawParticles();
+  drawFloats();
+
+  ctx.restore(); // камера
+
+  // HUD и оверлеи в экранных координатах
+  drawBossBar();
+  drawHUD();
+  drawMinimap();
+
+  // Вспышки
+  if (game.dmgFlash > 0) {
+    const a = game.dmgFlash;
+    const grad = ctx.createRadialGradient(W / 2, H / 2, H * 0.3, W / 2, H / 2, H * 0.85);
+    grad.addColorStop(0, 'rgba(255,40,40,0)');
+    grad.addColorStop(1, 'rgba(255,40,40,' + (a * 0.55) + ')');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+  }
+  if (game.goldFlash > 0) {
+    ctx.fillStyle = 'rgba(255,220,120,' + (game.goldFlash * 0.18) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // Виньетка
+  const vgrad = ctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 0.85);
+  vgrad.addColorStop(0, 'rgba(0,0,0,0)');
+  vgrad.addColorStop(1, 'rgba(0,0,0,0.5)');
+  ctx.fillStyle = vgrad;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.restore(); // shake
+
+  if (game.state === 'upgrade') drawUpgradeScreen();
+  if (game.state === 'dead')    drawDeathScreen();
+  if (game.encOpen)             renderEncyclopedia();
+}
+
+// ============================== ВВОД ==============================
+function codeToAction(code) {
+  switch (code) {
+    case 'KeyW': case 'ArrowUp':    return 'up';
+    case 'KeyS': case 'ArrowDown':  return 'down';
+    case 'KeyA': case 'ArrowLeft':  return 'left';
+    case 'KeyD': case 'ArrowRight': return 'right';
+    case 'KeyE': return 'pickup';
+    case 'KeyB': return 'build';
+    case 'KeyR': return 'restart';
+    case 'KeyU': return 'upcore';
+    case 'Digit1': return 'slot1';
+    case 'Digit2': return 'slot2';
+    case 'Digit3': return 'slot3';
+    case 'Digit4': return 'slot4';
+    case 'Space': return 'space';
+    case 'Tab': return 'tab';
+    case 'Escape': return 'escape';
+    case 'Enter': return 'enter';
+    default: return null;
+  }
+}
+
+window.addEventListener('keydown', function (e) {
+  const code = e.code;
+  keys[code] = true;
+
+  if (code === 'Space' || code === 'Tab' || code === 'Escape' ||
+      code.startsWith('Arrow') || code === 'Enter') {
+    e.preventDefault();
+  }
+
+  const action = codeToAction(code);
+
+  // Энциклопедия доступна почти везде
+  if (action === 'tab' || action === 'escape') {
+    if (game.state === 'start' || game.state === 'playing' || game.state === 'dead' || game.state === 'upgrade') {
+      game.encOpen = !game.encOpen;
+      return;
+    }
+  }
+
+  if (game.encOpen) {
+    if (code === 'Digit1') { game.encTab = 0; }
+    if (code === 'Digit2') { game.encTab = 1; }
+    if (code === 'Digit3') { game.encTab = 2; }
+    if (code === 'Digit4') { game.encTab = 3; }
+    if (code === 'Digit5') { game.encTab = 4; }
+    if (code === 'Digit6') { game.encTab = 5; }
+    if (code === 'Digit7') { game.encTab = 6; }
+    return;
+  }
+
+  if (game.state === 'start') {
+    if (action === 'space' || action === 'enter') { startRun(); return; }
+    // Переключение режима препа: T / N
+    if (code === 'KeyT') { game.prepMode = 'timer'; }
+    if (code === 'KeyN') { game.prepMode = 'no_timer'; }
+    return;
+  }
+
+  if (game.state === 'dead') {
+    if (action === 'restart') startRun();
+    return;
+  }
+
+  if (game.state === 'upgrade') {
+    if (action === 'slot1' || action === 'slot2' || action === 'slot3') {
+      const idx = parseInt(code.slice(-1), 10) - 1;
+      if (idx >= 0 && idx < game.choices.length) applyChoice(game.choices[idx]);
+    }
+    return;
+  }
+
+  if (game.state === 'playing') {
+    if (action === 'build') { game.buildMode = !game.buildMode; }
+    if (action === 'slot1') { game.buildSel = 0; game.buildMode = true; }
+    if (action === 'slot2') { game.buildSel = 1; game.buildMode = true; }
+    if (action === 'slot3') { game.buildSel = 2; game.buildMode = true; }
+    if (action === 'slot4') { game.buildSel = 3; game.buildMode = true; }
+    if (action === 'upcore') { upgradeCore(); }
+    if (action === 'space' && !game.waveActive) {
+      if (game.prepMode === 'timer') {
+        game.stones += 3;
+        game.stonePulse = 1;
+        floatText(game.player.x, game.player.y - 40, '+3 (готов)', '#ffd970', 14);
+      }
+      startWave();
+    }
+  }
+});
+
+window.addEventListener('keyup', function (e) {
+  keys[e.code] = false;
+});
+
+function updateMouse(e) {
+  const r = cv.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) * (W / r.width);
+  mouse.y = (e.clientY - r.top) * (H / r.height);
+  mouse.wx = mouse.x + cam.x;
+  mouse.wy = mouse.y + cam.y;
+}
+
+cv.addEventListener('mousemove', updateMouse);
+
+cv.addEventListener('mousedown', function (e) {
+  if (e.button !== 0) return;
+  updateMouse(e);
+
+  if (game.encOpen) {
+    // Клик по вкладкам
+    const tw = 122, th = 30;
+    const totalTabsW = ENC_TABS.length * (tw + 4) - 4;
+    const tx0 = (W - totalTabsW) / 2;
+    for (let i = 0; i < ENC_TABS.length; i++) {
+      const tx = tx0 + i * (tw + 4);
+      if (mouse.x > tx && mouse.x < tx + tw && mouse.y > 70 && mouse.y < 70 + th) {
+        game.encTab = i;
+        return;
+      }
+    }
+    return;
+  }
+
+  if (game.state === 'start') {
+    // Клик по переключателю режима
+    const bx = W / 2 - 160, by = 440;
+    if (mouse.x > bx && mouse.x < bx + 150 && mouse.y > by && mouse.y < by + 36) {
+      game.prepMode = 'timer';
+      return;
+    }
+    if (mouse.x > bx + 170 && mouse.x < bx + 320 && mouse.y > by && mouse.y < by + 36) {
+      game.prepMode = 'no_timer';
+      return;
+    }
+    startRun();
+    return;
+  }
+
+  if (game.state === 'upgrade') {
+    const cw = 280, ch = 260;
+    const totalW = cw * 3 + 40;
+    const startX = (W - totalW) / 2;
+    const cy = 190;
+    for (let i = 0; i < game.choices.length; i++) {
+      const x = startX + i * (cw + 20);
+      if (mouse.x > x && mouse.x < x + cw && mouse.y > cy && mouse.y < cy + ch) {
+        applyChoice(game.choices[i]);
+        return;
+      }
+    }
+    return;
+  }
+
+  if (game.state === 'playing') {
+    if (game.buildMode) {
+      tryPlace(mouse.wx, mouse.wy);
+    } else {
+      mouse.down = true;
+      tryAttack();
+    }
+  }
+});
+
+window.addEventListener('mouseup', function () { mouse.down = false; });
+cv.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+// ============================== ЦИКЛ ==============================
+let last = performance.now();
+function loop(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.05) dt = 0.05;
+
+  if (game.hitstop > 0) {
+    game.hitstop -= dt;
+    // Обновляем mouse.wx/wy даже на hitstop
+    mouse.wx = mouse.x + cam.x;
+    mouse.wy = mouse.y + cam.y;
+    render();
+    requestAnimationFrame(loop);
+    return;
+  }
+
+  // Обновляем mouse.world при движении камеры
+  mouse.wx = mouse.x + cam.x;
+  mouse.wy = mouse.y + cam.y;
+
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+
+initBg();
+resetGame();
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
